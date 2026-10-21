@@ -1,0 +1,19 @@
+{
+  "name": "campusfix",
+  "version": "1.0.0",
+  "description": "CampusFix: campus issue tracking and resolution system",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/lib.test.js test/api.test.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.0"
+  }
+}
