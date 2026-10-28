@@ -16,7 +16,8 @@ const badge = (s, k = '') => `<span class="badge ${k}${cls(s)}">${esc(s)}</span>
 const handle = e => toast(e.message, 1);
 const COLORS = { Low: '#5f8a66', Medium: '#9a7b0a', High: '#d9531e', Critical: '#b3261e' };
 const TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-// Approximate centre of Marwadi University, Rajkot. Building-level pins should be set by an admin.
+// OpenStreetMap-mapped centre of Marwadi University, Rajkot. This is a campus-centre marker,
+// not a verified building entrance. Administrators should configure building-level coordinates.
 const CENTER = [22.36758, 70.79573];
 
 let tt;
@@ -176,13 +177,16 @@ async function pReport() {
     <label for="c">Category <span aria-hidden="true">*</span></label><select id="c" required><option value="">Select category</option>${opts(meta.categories)}</select>
     <label for="l">Campus location <span aria-hidden="true">*</span></label><select id="l" required><option value="">Select location</option>${opts(meta.locations)}</select>
     <label for="r">Room / floor (optional)</label><input id="r" maxlength="60" placeholder="e.g. Block B, Room 204">
-    <p id="pinHint" class="muted">Optional: click the map to mark the exact spot. The map opens near Marwadi University.</p><div id="pickMap"></div>
+    <p id="pinHint" class="muted">The map opens at the approximate Marwadi University campus centre. Click the map to mark the exact issue location.</p><div id="pickMap"></div>
     <label for="ph">Photo (optional, JPG/PNG/WebP, max 5 MB)</label><input id="ph" type="file" accept="image/jpeg,image/png,image/webp">
     <img id="photoPreview" class="photo-preview hidden" alt="Preview of the selected issue photo">
     <label class="inline"><input type="checkbox" id="an"> Report anonymously (your name is hidden from other students and staff)</label>
     <button id="go">Submit report</button></div>`;
   let lat = null, lng = null, marker = null, previewUrl = null;
-  const map = L.map('pickMap').setView(CENTER, 16); L.tileLayer(TILES, { attribution: '© OpenStreetMap' }).addTo(map);
+  const map = L.map('pickMap').setView(CENTER, 17); L.tileLayer(TILES, { attribution: '© OpenStreetMap' }).addTo(map);
+  L.marker(CENTER).addTo(map)
+    .bindPopup('<b>Marwadi University</b><br>Campus centre (approximate). Click the map to mark the exact issue location.')
+    .bindTooltip('Marwadi University', { direction: 'top' });
   map.on('click', e => {
     lat = e.latlng.lat; lng = e.latlng.lng;
     marker ? marker.setLatLng(e.latlng) : marker = L.marker(e.latlng).addTo(map);
@@ -233,8 +237,11 @@ async function pReport() {
 // ---------- map ----------
 async function pMap() {
   $('view').innerHTML = `<h2>Campus map</h2><div class="filters"><select id="ms" aria-label="Status"><option value="">All statuses</option>${meta.statuses.map(s => `<option>${s}</option>`).join('')}</select>
-    <span class="muted">Marker colour = priority. Anonymous reports show only at building level.</span></div><div id="bigMap"></div><p id="mapEmpty" class="muted" hidden>No issue pins are available yet. Add a map pin while reporting an issue, or configure verified building coordinates under Admin → Manage.</p>`;
-  const map = L.map('bigMap').setView(CENTER, 16); L.tileLayer(TILES, { attribution: '© OpenStreetMap' }).addTo(map);
+    <span class="muted">Blue pin = Marwadi University campus centre (approximate). Issue marker colour = priority. Anonymous reports show only at building level.</span></div><div id="bigMap"></div><p id="mapEmpty" class="muted" hidden>No issue pins are available yet. Add a map pin while reporting an issue, or configure verified building coordinates under Admin → Manage.</p>`;
+  const map = L.map('bigMap').setView(CENTER, 17); L.tileLayer(TILES, { attribution: '© OpenStreetMap' }).addTo(map);
+  L.marker(CENTER).addTo(map)
+    .bindPopup('<b>Marwadi University</b><br>Campus centre (approximate). Configure verified building coordinates in Admin → Manage.')
+    .bindTooltip('Marwadi University', { direction: 'top' });
   const layer = L.layerGroup().addTo(map);
   const load = async () => {
     layer.clearLayers();
