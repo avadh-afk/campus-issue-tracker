@@ -7,8 +7,8 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "start": "node server.js",
-    "test": "node --test test/lib.test.js test/api.test.js"
+    "start": "node start.js",
+    "test": "node --test test/lib.test.js test/api.test.js test/security.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

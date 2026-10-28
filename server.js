@@ -5,12 +5,16 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+
+if (process.env.NODE_ENV === 'production' && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
+  console.error('Set JWT_SECRET to a strong random value of at least 32 characters.');
+  process.exit(1);
+}
+const SECRET = process.env.JWT_SECRET || 'dev-only-secret-do-not-use-in-production';
+const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, 'uploads'));
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const db = require('./db');
 const { STATUSES, PRIORITIES, TRANSITIONS, canTransition, suggest, similarity } = require('./lib');
-
-const SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) { console.error('Set JWT_SECRET'); process.exit(1); }
-fs.mkdirSync('uploads', { recursive: true });
 
 // ---------- helpers ----------
 const fmtDate = ms => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
@@ -30,12 +34,28 @@ function notify(userId, message, issueId) {
 }
 const audit = (userId, action, detail) => run('INSERT INTO audit_logs(user_id,action,detail) VALUES(?,?,?)', userId, action, detail || null);
 
-const hits = new Map(); // tiny in-memory rate limiter
+// Small per-process fixed-window limiter for this single-instance project.
+// Render's proxy IP is trusted one hop below; use a shared limiter if scaling to multiple instances.
+const hits = new Map();
+let lastRateLimitSweep = 0;
 const limit = (max, ms = 60000) => (req, res, next) => {
-  const k = req.ip + req.path, t = Date.now();
-  const a = (hits.get(k) || []).filter(x => t - x < ms);
-  if (a.length >= max) return bad(res, 'Too many requests, please slow down', 429);
-  a.push(t); hits.set(k, a); next();
+  const routePath = req.route?.path || req.path;
+  const key = `${req.ip}:${req.baseUrl}${routePath}`;
+  const t = Date.now();
+  let bucket = hits.get(key);
+  if (!bucket || bucket.resetAt <= t) bucket = { count: 0, resetAt: t + ms };
+  if (bucket.count >= max) {
+    res.set('Retry-After', String(Math.max(1, Math.ceil((bucket.resetAt - t) / 1000))));
+    return bad(res, 'Too many requests, please slow down', 429);
+  }
+  bucket.count += 1;
+  hits.set(key, bucket);
+  // Prevent unbounded growth from unique IP/path combinations.
+  if (hits.size > 5000 && t - lastRateLimitSweep > 30000) {
+    lastRateLimitSweep = t;
+    for (const [k, v] of hits) if (v.resetAt <= t) hits.delete(k);
+  }
+  next();
 };
 
 const ISSUE_SQL = `SELECT i.*, c.name AS category, c.department_id AS department_id, d.name AS department,
@@ -58,47 +78,79 @@ function shape(i, viewer) {
 }
 
 // ---------- auth ----------
-const tokenFor = u => jwt.sign({ id: u.id }, SECRET, { expiresIn: '7d' });
+const tokenFor = u => jwt.sign({ id: u.id, ver: u.auth_version }, SECRET, { expiresIn: '7d' });
 const publicUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, department_id: u.department_id });
 const auth = (req, res, next) => {
   try {
     const p = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), SECRET);
-    req.user = get('SELECT id,name,email,role,department_id FROM users WHERE id=?', p.id); // role always read from DB
+    const account = get('SELECT id,name,email,role,department_id,is_active,auth_version FROM users WHERE id=? AND is_active=1', p.id);
+    // Versioned tokens allow account deactivation/password reset to revoke earlier sessions.
+    req.user = account && Number.isInteger(p.ver) && p.ver === account.auth_version ? account : null;
   } catch { req.user = null; }
-  req.user ? next() : bad(res, 'Please log in', 401);
+  req.user ? next() : bad(res, 'Please log in again', 401);
 };
 const roles = (...r) => (req, res, next) => r.includes(req.user.role) ? next() : bad(res, 'Not allowed', 403);
 
 const upload = multer({
   storage: multer.diskStorage({
-    destination: 'uploads',
-    filename: (req, f, cb) => cb(null, crypto.randomUUID() + path.extname(f.originalname).toLowerCase().replace(/[^.a-z0-9]/g, ''))
+    destination: UPLOAD_DIR,
+    filename: (req, f, cb) => {
+      const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }[f.mimetype];
+      cb(null, crypto.randomUUID() + ext);
+    }
   }),
   limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (req, f, cb) => cb(null, /^image\/(jpeg|png|webp)$/.test(f.mimetype))
+  fileFilter: (req, f, cb) => {
+    if (!/^image\/(jpeg|png|webp)$/.test(f.mimetype)) return cb(new Error('Photo must be JPG, PNG, or WebP.'));
+    cb(null, true);
+  }
 });
 
 const app = express();
 app.disable('x-powered-by');
-app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); next(); });
+// The app is normally behind Render's HTTPS proxy; trust only the immediate proxy hop.
+app.set('trust proxy', 1);
+app.use((req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(self)',
+    'Cross-Origin-Opener-Policy': 'same-origin'
+  });
+  next();
+});
 app.use(express.json({ limit: '100kb' }));
-app.use(express.static('public'));
-app.use('/uploads', express.static('uploads'));
+app.use(express.static(path.join(__dirname, 'public')));
+// Photos are only served to authenticated users, because issue images may contain sensitive context.
+app.get('/uploads/:filename', auth, (req, res) => {
+  const filename = String(req.params.filename || '');
+  if (!/^[0-9a-f-]{36}\.(?:jpg|png|webp)$/i.test(filename)) return bad(res, 'Photo not found', 404);
+  const fullPath = path.join(UPLOAD_DIR, filename);
+  if (!fs.existsSync(fullPath)) return bad(res, 'Photo not found', 404);
+  res.set('Cache-Control', 'private, no-store');
+  res.sendFile(fullPath, err => {
+    if (err && !res.headersSent) res.status(err.statusCode || 404).end();
+  });
+});
 
 app.post('/api/signup', limit(10), (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !/^\S+@\S+\.\S+$/.test(email || '') || (password || '').length < 6)
-    return bad(res, 'Name, a valid email and a 6+ character password are required');
+  const name = String(req.body.name || '').trim();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (!name || name.length > 80 || !/^\S+@\S+\.\S+$/.test(email) || email.length > 254 || password.length < 8 || password.length > 128)
+    return bad(res, 'Enter a name (up to 80 characters), a valid email, and a password of 8-128 characters');
   try {
-    const r = run('INSERT INTO users(name,email,password) VALUES(?,?,?)', String(name).slice(0, 80), email.toLowerCase(), bcrypt.hashSync(password, 10));
+    const r = run('INSERT INTO users(name,email,password) VALUES(?,?,?)', name, email, bcrypt.hashSync(password, 12));
     const u = get('SELECT * FROM users WHERE id=?', Number(r.lastInsertRowid));
-    res.json({ token: tokenFor(u), user: publicUser(u) });
+    res.status(201).json({ token: tokenFor(u), user: publicUser(u) });
   } catch { bad(res, 'Email already registered'); }
 });
 
 app.post('/api/login', limit(10), (req, res) => {
-  const u = get('SELECT * FROM users WHERE email=?', String(req.body.email || '').toLowerCase());
-  if (!u || !bcrypt.compareSync(req.body.password || '', u.password)) return bad(res, 'Invalid email or password', 401);
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const u = get('SELECT * FROM users WHERE email=? AND is_active=1', email);
+  if (!u || !bcrypt.compareSync(String(req.body.password || ''), u.password)) return bad(res, 'Invalid email or password', 401);
   res.json({ token: tokenFor(u), user: publicUser(u) });
 });
 
@@ -136,7 +188,10 @@ app.get('/api/issues', auth, (req, res) => {
   if (q.overdue) { sql += ` AND i.due_at<? AND i.status NOT IN ${CLOSED}`; p.push(now()); }
   if (q.q) { const l = '%' + String(q.q).slice(0, 80) + '%'; sql += ' AND (i.title LIKE ? OR i.description LIKE ? OR i.code LIKE ?)'; p.push(l, l, l); }
   sql += q.sort === 'votes' ? ' ORDER BY votes DESC, i.created_at DESC' : ' ORDER BY i.created_at DESC';
-  const size = Math.min(+q.limit || 20, 200), page = Math.max(1, +q.page || 1);
+  const requestedSize = Math.trunc(Number(q.limit) || 20);
+  const size = Math.min(Math.max(requestedSize, 1), 200);
+  const requestedPage = Math.trunc(Number(q.page) || 1);
+  const page = Math.min(Math.max(requestedPage, 1), 1000000);
   sql += ' LIMIT ? OFFSET ?'; p.push(size, (page - 1) * size);
   res.json(all(sql, ...p).map(i => shape(i, req.user)));
 });
@@ -155,16 +210,39 @@ app.get('/api/issues/:id', auth, (req, res) => {
   res.json(o);
 });
 
+function hasValidImageSignature(filePath, mime) {
+  let fd;
+  try {
+    const header = Buffer.alloc(12);
+    fd = fs.openSync(filePath, 'r');
+    const count = fs.readSync(fd, header, 0, header.length, 0);
+    const b = header.subarray(0, count);
+    if (mime === 'image/jpeg') return b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+    if (mime === 'image/png') return b.length >= 8 && b.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
+    if (mime === 'image/webp') return b.length >= 12 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP';
+    return false;
+  } catch { return false; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+function removeUpload(file) {
+  if (file?.path) { try { fs.rmSync(file.path, { force: true }); } catch { /* best-effort cleanup */ } }
+}
+
 app.post('/api/issues', auth, roles('student'), limit(10), upload.single('photo'), (req, res) => {
-  const b = req.body, title = (b.title || '').trim(), description = (b.description || '').trim();
-  if (title.length < 5 || title.length > 120) return bad(res, 'Title must be 5-120 characters');
-  if (description.length < 10 || description.length > 2000) return bad(res, 'Description must be 10-2000 characters');
-  const cat = get('SELECT * FROM categories WHERE id=?', +b.category_id);
-  const loc = get('SELECT id FROM locations WHERE id=?', +b.location_id);
-  if (!cat) return bad(res, 'Choose a valid category');
-  if (!loc) return bad(res, 'Choose a valid location');
-  const lat = b.lat !== undefined && b.lat !== '' ? Number(b.lat) : null, lng = b.lng !== undefined && b.lng !== '' ? Number(b.lng) : null;
-  if ((lat !== null && !isFinite(lat)) || (lng !== null && !isFinite(lng))) return bad(res, 'Invalid map coordinates');
+  const reject = (message, status = 400) => { removeUpload(req.file); return bad(res, message, status); };
+  const b = req.body, title = String(b.title || '').trim(), description = String(b.description || '').trim();
+  if (req.file && !hasValidImageSignature(req.file.path, req.file.mimetype)) return reject('Uploaded file is not a valid JPG, PNG, or WebP image');
+  if (title.length < 5 || title.length > 120) return reject('Title must be 5-120 characters');
+  if (description.length < 10 || description.length > 2000) return reject('Description must be 10-2000 characters');
+  const cat = get('SELECT * FROM categories WHERE id=?', Number(b.category_id));
+  const loc = get('SELECT id FROM locations WHERE id=?', Number(b.location_id));
+  if (!cat) return reject('Choose a valid category');
+  if (!loc) return reject('Choose a valid location');
+  const hasLat = b.lat !== undefined && b.lat !== '', hasLng = b.lng !== undefined && b.lng !== '';
+  const lat = hasLat ? Number(b.lat) : null, lng = hasLng ? Number(b.lng) : null;
+  if (hasLat !== hasLng) return reject('Provide both map coordinates, or leave both empty');
+  if ((lat !== null && (!Number.isFinite(lat) || lat < -90 || lat > 90)) ||
+      (lng !== null && (!Number.isFinite(lng) || lng < -180 || lng > 180))) return reject('Invalid map coordinates');
   const priority = suggest(title + ' ' + description).priority; // system-suggested; staff can change it
   const r = run(`INSERT INTO issues(code,user_id,title,description,category_id,location_id,room,lat,lng,photo,priority,anonymous,due_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, 'tmp-' + crypto.randomUUID(), req.user.id, title, description, cat.id, loc.id,
@@ -173,7 +251,7 @@ app.post('/api/issues', auth, roles('student'), limit(10), upload.single('photo'
   const id = Number(r.lastInsertRowid), code = `CIT-${new Date().getFullYear()}-${String(id).padStart(4, '0')}`;
   run('UPDATE issues SET code=? WHERE id=?', code, id);
   run('INSERT INTO status_history(issue_id,from_status,to_status,changed_by,note) VALUES(?,?,?,?,?)', id, null, 'Submitted', req.user.id, 'Issue reported');
-  all("SELECT id FROM users WHERE role='admin' OR (role='staff' AND department_id=?)", cat.department_id)
+  all("SELECT id FROM users WHERE is_active=1 AND (role='admin' OR (role='staff' AND department_id=?))", cat.department_id)
     .forEach(u => notify(u.id, `New ${priority} issue ${code} (${cat.name})`, id));
   res.json({ id, code, priority });
 });
@@ -231,7 +309,7 @@ app.post('/api/issues/:id/status', auth, (req, res) => {
 });
 
 app.post('/api/issues/:id/assign', auth, roles('admin'), (req, res) => {
-  const i = get(ISSUE_SQL + ' WHERE i.id=?', +req.params.id), s = get("SELECT * FROM users WHERE id=? AND role='staff'", +req.body.staff_id);
+  const i = get(ISSUE_SQL + ' WHERE i.id=?', +req.params.id), s = get("SELECT * FROM users WHERE id=? AND role='staff' AND is_active=1", +req.body.staff_id);
   if (!i) return bad(res, 'Issue not found', 404);
   if (!s) return bad(res, 'Choose a valid staff member');
   if (['Resolved', 'Rejected'].includes(i.status)) return bad(res, 'Reopen the issue before assigning');
@@ -314,7 +392,7 @@ app.get('/api/dashboard', auth, (req, res) => {
 
 // ---------- administration ----------
 app.get('/api/users', auth, roles('admin'), (req, res) =>
-  res.json(all('SELECT id,name,email,role,department_id,created_at FROM users ORDER BY role, name')));
+  res.json(all('SELECT id,name,email,role,department_id,created_at FROM users WHERE is_active=1 ORDER BY role, name')));
 
 app.patch('/api/users/:id', auth, roles('admin'), (req, res) => {
   const u = get('SELECT * FROM users WHERE id=?', +req.params.id);
@@ -322,6 +400,8 @@ app.patch('/api/users/:id', auth, roles('admin'), (req, res) => {
   if (u.id === req.user.id) return bad(res, 'You cannot change your own role');
   const role = req.body.role, dept = req.body.department_id ? +req.body.department_id : null;
   if (!['student', 'staff', 'admin'].includes(role)) return bad(res, 'Invalid role');
+  if (u.role === 'admin' && role !== 'admin' && get("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND is_active=1").n <= 1)
+    return bad(res, 'Promote another administrator before changing the last active admin role');
   if (dept && !get('SELECT 1 FROM departments WHERE id=?', dept)) return bad(res, 'Invalid department');
   if (role === 'staff' && !dept) return bad(res, 'Staff must belong to a department');
   run('UPDATE users SET role=?, department_id=? WHERE id=?', role, role === 'staff' ? dept : null, u.id);
@@ -337,8 +417,35 @@ const addNamed = (table, extra) => (req, res) => {
 };
 app.post('/api/departments', auth, roles('admin'), addNamed('department', (r, n) => run('INSERT INTO departments(name) VALUES(?)', n)));
 app.post('/api/categories', auth, roles('admin'), addNamed('category', (r, n) => run('INSERT INTO categories(name,department_id) VALUES(?,?)', n, +r.body.department_id)));
-app.post('/api/locations', auth, roles('admin'), addNamed('location', (r, n) =>
-  run('INSERT INTO locations(name,lat,lng) VALUES(?,?,?)', n, isFinite(+r.body.lat) && r.body.lat !== '' ? +r.body.lat : null, isFinite(+r.body.lng) && r.body.lng !== '' ? +r.body.lng : null)));
+app.post('/api/locations', auth, roles('admin'), (req, res) => {
+  const name = String(req.body.name || '').trim().slice(0, 80);
+  const latText = req.body.lat === undefined ? '' : String(req.body.lat).trim();
+  const lngText = req.body.lng === undefined ? '' : String(req.body.lng).trim();
+  if (!name) return bad(res, 'Location name is required');
+  if ((latText === '') !== (lngText === '')) return bad(res, 'Provide both latitude and longitude, or leave both empty');
+  const lat = latText === '' ? null : Number(latText), lng = lngText === '' ? null : Number(lngText);
+  if (lat !== null && (!Number.isFinite(lat) || lat < -90 || lat > 90)) return bad(res, 'Latitude must be between -90 and 90');
+  if (lng !== null && (!Number.isFinite(lng) || lng < -180 || lng > 180)) return bad(res, 'Longitude must be between -180 and 180');
+  try {
+    run('INSERT INTO locations(name,lat,lng) VALUES(?,?,?)', name, lat, lng);
+    audit(req.user.id, 'create_location', `${name} (${lat ?? 'no pin'}, ${lng ?? 'no pin'})`);
+    res.status(201).json({ ok: true });
+  } catch (e) { return bad(res, e.message.includes('UNIQUE') ? 'Location already exists' : 'Invalid location'); }
+});
+
+app.patch('/api/locations/:id', auth, roles('admin'), (req, res) => {
+  const location = get('SELECT * FROM locations WHERE id=?', Number(req.params.id));
+  if (!location) return bad(res, 'Location not found', 404);
+  const latText = req.body.lat === undefined ? '' : String(req.body.lat).trim();
+  const lngText = req.body.lng === undefined ? '' : String(req.body.lng).trim();
+  if ((latText === '') !== (lngText === '')) return bad(res, 'Provide both latitude and longitude, or leave both empty');
+  const lat = latText === '' ? null : Number(latText), lng = lngText === '' ? null : Number(lngText);
+  if (lat !== null && (!Number.isFinite(lat) || lat < -90 || lat > 90)) return bad(res, 'Latitude must be between -90 and 90');
+  if (lng !== null && (!Number.isFinite(lng) || lng < -180 || lng > 180)) return bad(res, 'Longitude must be between -180 and 180');
+  run('UPDATE locations SET lat=?,lng=? WHERE id=?', lat, lng, location.id);
+  audit(req.user.id, 'update_location_coordinates', `${location.name}: ${lat ?? 'no pin'}, ${lng ?? 'no pin'}`);
+  res.json({ ok: true });
+});
 
 app.put('/api/sla', auth, roles('admin'), (req, res) => {
   for (const p of PRIORITIES) {
@@ -368,10 +475,10 @@ function slaJob() {
   const t = now(), soon = fmtDate(Date.now() + 2 * 3600e3);
   const base = `SELECT i.id, i.code, i.assigned_to, c.department_id FROM issues i LEFT JOIN categories c ON c.id=i.category_id
     WHERE i.status NOT IN ('Resolved','Rejected','Awaiting Student Confirmation')`;
-  const staffFor = i => i.assigned_to ? [{ id: i.assigned_to }] : all("SELECT id FROM users WHERE role='staff' AND department_id=?", i.department_id);
+  const staffFor = i => i.assigned_to ? all("SELECT id FROM users WHERE id=? AND role='staff' AND is_active=1", i.assigned_to) : all("SELECT id FROM users WHERE role='staff' AND is_active=1 AND department_id=?", i.department_id);
   for (const i of all(base + ' AND i.due_at<? AND i.escalated=0', t)) {
     run('UPDATE issues SET escalated=1 WHERE id=?', i.id);
-    [...all("SELECT id FROM users WHERE role='admin'"), ...staffFor(i)].forEach(u => notify(u.id, `OVERDUE: ${i.code} passed its deadline and was escalated`, i.id));
+    [...all("SELECT id FROM users WHERE role='admin' AND is_active=1"), ...staffFor(i)].forEach(u => notify(u.id, `OVERDUE: ${i.code} passed its deadline and was escalated`, i.id));
     audit(null, 'sla_escalation', i.code);
   }
   for (const i of all(base + ' AND i.due_at BETWEEN ? AND ? AND i.warned=0', t, soon)) {
@@ -382,7 +489,17 @@ function slaJob() {
 setInterval(slaJob, 60000); slaJob();
 
 app.use('/api', (req, res) => bad(res, 'Not found', 404));
-app.use((err, req, res, next) => { console.error(err.message); bad(res, 'Something went wrong', 500); }); // no stack traces to the client
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'Photo must be 5 MB or smaller' : 'Invalid photo upload';
+    return bad(res, message, 400);
+  }
+  if (err?.message === 'Photo must be JPG, PNG, or WebP.') return bad(res, err.message, 400);
+  if (err?.type === 'entity.too.large') return bad(res, 'Request body is too large', 413);
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) return bad(res, 'Invalid JSON body', 400);
+  console.error(err?.message || err);
+  bad(res, 'Something went wrong', 500);
+}); // Do not expose stack traces to clients.
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`CampusFix running on http://localhost:${PORT}`));

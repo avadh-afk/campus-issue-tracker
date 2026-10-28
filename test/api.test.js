@@ -8,10 +8,16 @@ const PORT = 3917, DB = 'test-temp.db', BASE = `http://localhost:${PORT}`;
 let server;
 
 test.before(async () => {
-  server = spawn(process.execPath, ['server.js'], { env: { ...process.env, PORT, DB_FILE: DB }, stdio: 'pipe' });
+  server = spawn(process.execPath, ['server.js'], { env: { ...process.env, NODE_ENV: 'test', SEED_DEMO_USERS: 'true', PORT, DB_FILE: DB }, stdio: 'pipe' });
   await new Promise((ok, fail) => { server.stdout.on('data', d => /running/.test(d) && ok()); server.on('error', fail); setTimeout(() => fail(new Error('server did not start')), 8000); });
 });
-test.after(() => { server.kill(); for (const f of [DB, DB + '-wal', DB + '-shm']) fs.rmSync(f, { force: true }); });
+test.after(async () => {
+  if (server && server.exitCode === null) {
+    server.kill();
+    await new Promise(resolve => server.once('exit', resolve));
+  }
+  for (const f of [DB, DB + '-wal', DB + '-shm']) fs.rmSync(f, { force: true });
+});
 
 const call = async (path, { token, method = 'GET', body } = {}) => {
   const isForm = body instanceof FormData;

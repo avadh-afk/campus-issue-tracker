@@ -1,4 +1,13 @@
-let token = localStorage.getItem('token'), user = JSON.parse(localStorage.getItem('user') || 'null'), meta = null;
+// Some browser contexts (privacy settings, embedded previews, or restricted origins) may deny
+// access to localStorage. Keep the app usable for the current tab instead of crashing at startup.
+const sessionStore = {
+  get(key) { try { return window.localStorage.getItem(key); } catch { return null; } },
+  set(key, value) { try { window.localStorage.setItem(key, value); return true; } catch { return false; } },
+  clear() { try { window.localStorage.clear(); return true; } catch { return false; } }
+};
+let token = sessionStore.get('token'), user = null, meta = null;
+try { user = JSON.parse(sessionStore.get('user') || 'null'); }
+catch { sessionStore.clear(); token = null; user = null; }
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = s => s ? new Date(s.replace(' ', 'T') + 'Z').toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : '—';
@@ -7,14 +16,15 @@ const badge = (s, k = '') => `<span class="badge ${k}${cls(s)}">${esc(s)}</span>
 const handle = e => toast(e.message, 1);
 const COLORS = { Low: '#5f8a66', Medium: '#9a7b0a', High: '#d9531e', Critical: '#b3261e' };
 const TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-const CENTER = [22.3039, 70.8022];
+// Approximate centre of Marwadi University, Rajkot. Building-level pins should be set by an admin.
+const CENTER = [22.36758, 70.79573];
 
 let tt;
 function toast(m, err) {
   const t = $('toast'); t.textContent = m; t.className = err ? 'err' : ''; t.style.display = 'block';
   clearTimeout(tt); tt = setTimeout(() => t.style.display = 'none', 3500);
 }
-function logout() { localStorage.clear(); token = null; user = null; location.hash = ''; boot(); }
+function logout() { sessionStore.clear(); token = null; user = null; location.hash = ''; boot(); }
 
 async function api(url, opts = {}) {
   opts.headers = { ...(opts.headers || {}) };
@@ -37,15 +47,19 @@ function landing() {
     <div class="card"><h2 id="aT">Login</h2>
       <div id="nameBox" class="hidden"><label for="aN">Full name</label><input id="aN" autocomplete="name"></div>
       <label for="aE">Email</label><input id="aE" type="email" autocomplete="email">
-      <label for="aP">Password</label><input id="aP" type="password" autocomplete="current-password">
+      <label for="aP">Password</label><input id="aP" type="password" autocomplete="current-password" maxlength="128">
       <button id="aB">Login</button>
       <p><a href="#" id="aS">New student? Create an account</a></p>
-      <p class="muted">Development accounts: see the README.</p></div></div>`;
-  $('aS').onclick = e => { e.preventDefault(); signup = !signup; $('aT').textContent = signup ? 'Create account' : 'Login'; $('aB').textContent = signup ? 'Sign up' : 'Login'; $('nameBox').classList.toggle('hidden', !signup); };
+      <p class="muted" id="authHint">Sign in to report campus problems and track their progress.</p></div></div>`;
+  $('aS').onclick = e => { e.preventDefault(); signup = !signup; $('aT').textContent = signup ? 'Create account' : 'Login'; $('aB').textContent = signup ? 'Sign up' : 'Login'; $('nameBox').classList.toggle('hidden', !signup); $('aP').autocomplete = signup ? 'new-password' : 'current-password'; $('authHint').textContent = signup ? 'Use a unique password with at least 8 characters.' : 'Sign in to report campus problems and track their progress.'; };
   $('aB').onclick = async () => {
     try {
       const d = await api(signup ? '/api/signup' : '/api/login', { method: 'POST', body: { name: $('aN').value, email: $('aE').value, password: $('aP').value } });
-      token = d.token; user = d.user; localStorage.setItem('token', token); localStorage.setItem('user', JSON.stringify(user)); boot();
+      token = d.token; user = d.user;
+      const tokenSaved = sessionStore.set('token', token);
+      const userSaved = sessionStore.set('user', JSON.stringify(user));
+      boot();
+      if (!tokenSaved || !userSaved) toast('Browser storage is blocked. CampusFix can work in this tab, but refreshing will sign you out.', 1);
     } catch (e) { handle(e); }
   };
 }
@@ -156,19 +170,35 @@ async function pIssues(qs) {
 async function pReport() {
   if (user.role !== 'student') { $('view').innerHTML = '<div class="card">Only students can report issues.</div>'; return; }
   $('view').innerHTML = `<h2>Report an issue</h2><div class="card">
-    <label for="t">Title</label><input id="t" maxlength="120">
-    <label for="d">Description</label><textarea id="d" maxlength="2000"></textarea>
+    <label for="t">Title <span aria-hidden="true">*</span></label><input id="t" maxlength="120" required placeholder="e.g. Wi-Fi not working in Lab 3">
+    <label for="d">Description <span aria-hidden="true">*</span></label><textarea id="d" maxlength="2000" required placeholder="Describe what happened and where it is affecting people."></textarea>
     <div id="sg"></div>
-    <label for="c">Category</label><select id="c"><option value="">Select category</option>${opts(meta.categories)}</select>
-    <label for="l">Campus location</label><select id="l"><option value="">Select location</option>${opts(meta.locations)}</select>
-    <label for="r">Room / floor (optional)</label><input id="r" maxlength="60">
-    <p class="muted">Optional: click the map to mark the exact spot.</p><div id="pickMap"></div>
+    <label for="c">Category <span aria-hidden="true">*</span></label><select id="c" required><option value="">Select category</option>${opts(meta.categories)}</select>
+    <label for="l">Campus location <span aria-hidden="true">*</span></label><select id="l" required><option value="">Select location</option>${opts(meta.locations)}</select>
+    <label for="r">Room / floor (optional)</label><input id="r" maxlength="60" placeholder="e.g. Block B, Room 204">
+    <p id="pinHint" class="muted">Optional: click the map to mark the exact spot. The map opens near Marwadi University.</p><div id="pickMap"></div>
     <label for="ph">Photo (optional, JPG/PNG/WebP, max 5 MB)</label><input id="ph" type="file" accept="image/jpeg,image/png,image/webp">
+    <img id="photoPreview" class="photo-preview hidden" alt="Preview of the selected issue photo">
     <label class="inline"><input type="checkbox" id="an"> Report anonymously (your name is hidden from other students and staff)</label>
     <button id="go">Submit report</button></div>`;
-  let lat = null, lng = null, marker = null;
+  let lat = null, lng = null, marker = null, previewUrl = null;
   const map = L.map('pickMap').setView(CENTER, 16); L.tileLayer(TILES, { attribution: '© OpenStreetMap' }).addTo(map);
-  map.on('click', e => { lat = e.latlng.lat; lng = e.latlng.lng; marker ? marker.setLatLng(e.latlng) : marker = L.marker(e.latlng).addTo(map); });
+  map.on('click', e => {
+    lat = e.latlng.lat; lng = e.latlng.lng;
+    marker ? marker.setLatLng(e.latlng) : marker = L.marker(e.latlng).addTo(map);
+    $('pinHint').textContent = `Exact pin selected: ${lat.toFixed(6)}, ${lng.toFixed(6)}. Click the map again to move it.`;
+  });
+  $('ph').onchange = () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+    const file = $('ph').files[0], preview = $('photoPreview');
+    if (!file) { preview.classList.add('hidden'); preview.removeAttribute('src'); return; }
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 5 * 1024 * 1024) {
+      $('ph').value = ''; preview.classList.add('hidden'); preview.removeAttribute('src');
+      toast('Choose a JPG, PNG, or WebP image no larger than 5 MB.', 1); return;
+    }
+    previewUrl = URL.createObjectURL(file); preview.src = previewUrl; preview.classList.remove('hidden');
+  };
 
   let timer;
   const check = () => { clearTimeout(timer); timer = setTimeout(async () => {
@@ -185,6 +215,10 @@ async function pReport() {
   $('t').oninput = check; $('d').oninput = check;
 
   $('go').onclick = async () => {
+    if ($('t').value.trim().length < 5 || $('t').value.trim().length > 120) return toast('Title must be 5-120 characters.', 1);
+    if ($('d').value.trim().length < 10 || $('d').value.trim().length > 2000) return toast('Description must be 10-2000 characters.', 1);
+    if (!$('c').value) return toast('Please choose an issue category.', 1);
+    if (!$('l').value) return toast('Please choose a campus location.', 1);
     const fd = new FormData();
     fd.append('title', $('t').value); fd.append('description', $('d').value); fd.append('category_id', $('c').value);
     fd.append('location_id', $('l').value); fd.append('room', $('r').value); fd.append('anonymous', $('an').checked ? '1' : '0');
@@ -199,14 +233,16 @@ async function pReport() {
 // ---------- map ----------
 async function pMap() {
   $('view').innerHTML = `<h2>Campus map</h2><div class="filters"><select id="ms" aria-label="Status"><option value="">All statuses</option>${meta.statuses.map(s => `<option>${s}</option>`).join('')}</select>
-    <span class="muted">Marker colour = priority. Anonymous reports show only at building level.</span></div><div id="bigMap"></div>`;
+    <span class="muted">Marker colour = priority. Anonymous reports show only at building level.</span></div><div id="bigMap"></div><p id="mapEmpty" class="muted" hidden>No issue pins are available yet. Add a map pin while reporting an issue, or configure verified building coordinates under Admin → Manage.</p>`;
   const map = L.map('bigMap').setView(CENTER, 16); L.tileLayer(TILES, { attribution: '© OpenStreetMap' }).addTo(map);
   const layer = L.layerGroup().addTo(map);
   const load = async () => {
     layer.clearLayers();
     const items = await api('/api/issues?limit=200' + ($('ms').value ? '&status=' + encodeURIComponent($('ms').value) : ''));
-    items.filter(i => i.lat != null).forEach(i => L.circleMarker([i.lat, i.lng], { radius: 9, color: '#fff', weight: 2, fillColor: COLORS[i.priority], fillOpacity: .9 }).addTo(layer)
+    const mapped = items.filter(i => Number.isFinite(i.lat) && Number.isFinite(i.lng));
+    mapped.forEach(i => L.circleMarker([i.lat, i.lng], { radius: 9, color: '#fff', weight: 2, fillColor: COLORS[i.priority], fillOpacity: .9 }).addTo(layer)
       .bindPopup(`<b>${esc(i.title)}</b><br>${esc(i.code)} · ${esc(i.status)} · ${esc(i.priority)}<br><a href="#/issue/${i.id}">Open</a>`));
+    $('mapEmpty').hidden = mapped.length > 0;
   };
   $('ms').onchange = () => load().catch(handle); await load();
 }
@@ -222,7 +258,7 @@ async function pIssue(id) {
   $('view').innerHTML = `<p><a href="#/issues">← Back to issues</a></p>
   <div class="card detail"><div class="row between"><h2>${esc(i.title)}</h2><div>${badge(i.priority, 'p-')} ${badge(i.status)}${i.overdue ? ' <span class="badge overdue">Overdue</span>' : ''}</div></div>
     <div class="muted">${esc(i.code)} · ${esc(i.category)} · ${esc(i.department)} · ${esc(i.location)}${i.room ? ', ' + esc(i.room) : ''} · Reported by ${esc(i.reporter)} on ${fmt(i.created_at)}</div>
-    <p>${esc(i.description).replace(/\n/g, '<br>')}</p>${i.photo ? `<img src="/uploads/${esc(i.photo)}" alt="Photo attached to the report">` : ''}
+    <p>${esc(i.description).replace(/\n/g, '<br>')}</p>${i.photo ? '<img id="issuePhoto" alt="Photo attached to the report" loading="lazy">' : ''}
     <p class="muted">Target resolution: ${fmt(i.due_at)} · Assigned to: ${esc(i.assignee_name || 'not yet assigned')}</p>
     ${i.lat != null ? '<div id="mm" class="miniMap"></div>' : ''}
     <p><button class="ghost ${i.voted ? 'on' : ''}" aria-label="Upvote" onclick="vote(${i.id},this)">▲ ${i.votes}</button></p></div>
@@ -235,6 +271,16 @@ async function pIssue(id) {
   <div class="card"><h3>Activity timeline</h3><div class="timeline">${i.history.map(h => `<div><b>${esc(h.to_status)}</b> <span class="muted">${fmt(h.created_at)} · ${esc(h.by_name || 'System')}</span>${h.note ? `<br>${esc(h.note)}` : ''}</div>`).join('')}</div></div>
   <div class="card"><h3>Comments</h3>${i.comments.map(c => `<div class="comment"><b>${esc(c.name)}</b> <span class="badge">${esc(c.role)}</span> <span class="muted">${fmt(c.created_at)}</span><br>${esc(c.body)}</div>`).join('') || '<p class="muted">No comments yet.</p>'}
     <label for="cm">Add a comment</label><textarea id="cm" maxlength="1000"></textarea><button onclick="sendComment(${i.id})">Post comment</button></div>`;
+  if (i.photo) {
+    const photo = $('issuePhoto');
+    try {
+      const response = await fetch('/uploads/' + encodeURIComponent(i.photo), { headers: { Authorization: 'Bearer ' + token } });
+      if (!response.ok) throw new Error('Photo unavailable');
+      const objectUrl = URL.createObjectURL(await response.blob());
+      photo.onload = () => URL.revokeObjectURL(objectUrl);
+      photo.src = objectUrl;
+    } catch { photo.alt = 'The attached photo could not be loaded.'; }
+  }
   if (i.lat != null) { const m = L.map('mm', { scrollWheelZoom: false }).setView([i.lat, i.lng], 17); L.tileLayer(TILES, { attribution: '© OpenStreetMap' }).addTo(m); L.marker([i.lat, i.lng]).addTo(m); }
 }
 const post = async (url, body, msg) => { try { await api(url, { method: 'POST', body }); toast(msg); refreshUnread(); route(); } catch (e) { handle(e); } };
@@ -270,13 +316,16 @@ async function pManage() {
     <p class="muted">Overdue issues are escalated automatically to admins and the responsible staff.</p></div>
   <div class="card"><h3>Add department</h3><input id="nd" placeholder="Name" aria-label="Department name"><button onclick="addItem('departments',{name:$('nd').value})">Add</button></div>
   <div class="card"><h3>Add category</h3><input id="nc" placeholder="Name" aria-label="Category name"><select id="ncd" aria-label="Department">${opts(meta.departments)}</select><button onclick="addItem('categories',{name:$('nc').value,department_id:$('ncd').value})">Add</button></div>
-  <div class="card"><h3>Add campus location</h3><input id="nl" placeholder="Building name" aria-label="Building name"><div class="row"><input id="nla" placeholder="Latitude" aria-label="Latitude"><input id="nlg" placeholder="Longitude" aria-label="Longitude"></div><button onclick="addItem('locations',{name:$('nl').value,lat:$('nla').value,lng:$('nlg').value})">Add</button></div>
+  <div class="card"><h3>Add campus location</h3><input id="nl" placeholder="Building name" aria-label="Building name"><div class="row"><input id="nla" type="number" step="any" min="-90" max="90" placeholder="Latitude (optional)" aria-label="Latitude"><input id="nlg" type="number" step="any" min="-180" max="180" placeholder="Longitude (optional)" aria-label="Longitude"></div><button onclick="addItem('locations',{name:$('nl').value,lat:$('nla').value,lng:$('nlg').value})">Add</button><p class="muted">Only enter verified coordinates. Leave both blank until you have checked the location on a map.</p></div>
+  <div class="card" style="overflow-x:auto"><h3>Configure existing map locations</h3><p class="muted">Set precise coordinates for your campus buildings. These pins are used when an issue has no exact map pin.</p><table><tr><th>Location</th><th>Latitude</th><th>Longitude</th><th></th></tr>
+    ${meta.locations.map(l => `<tr><td>${esc(l.name)}</td><td><input type="number" step="any" min="-90" max="90" id="llat${l.id}" value="${l.lat ?? ''}" aria-label="${esc(l.name)} latitude"></td><td><input type="number" step="any" min="-180" max="180" id="llng${l.id}" value="${l.lng ?? ''}" aria-label="${esc(l.name)} longitude"></td><td><button class="ghost" onclick="saveLocation(${l.id})">Save</button></td></tr>`).join('')}</table></div>
   <div class="card"><h3>Reports</h3><button onclick="exportCsv()">Download all issues (CSV)</button> <span class="muted">Reporter identities are not included.</span></div>
   <div class="card" style="overflow-x:auto"><h3>Audit log (latest 50)</h3><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>
     ${audit.map(a => `<tr><td>${fmt(a.created_at)}</td><td>${esc(a.user_name || 'System')}</td><td>${esc(a.action)}</td><td>${esc(a.detail)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">Nothing yet.</td></tr>'}</table></div>`;
 }
 const saveSla = async () => { try { const b = {}; meta.priorities.forEach(p => b[p] = $('s' + p).value); await api('/api/sla', { method: 'PUT', body: b }); meta = await api('/api/meta'); toast('Targets saved'); } catch (e) { handle(e); } };
 const addItem = async (kind, body) => { try { await api('/api/' + kind, { method: 'POST', body }); meta = await api('/api/meta'); toast('Added'); pManage(); } catch (e) { handle(e); } };
+const saveLocation = async id => { try { await api('/api/locations/' + id, { method: 'PATCH', body: { lat: $('llat' + id).value, lng: $('llng' + id).value } }); meta = await api('/api/meta'); toast('Location coordinates saved'); pManage(); } catch (e) { handle(e); } };
 async function exportCsv() {
   try { const t = await api('/api/export.csv'), a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([t], { type: 'text/csv' })); a.download = 'issues.csv'; a.click(); } catch (e) { handle(e); }
 }
